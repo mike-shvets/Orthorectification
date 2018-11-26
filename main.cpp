@@ -22,14 +22,14 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     GDALAllRegister();
 
     // Read satellite image
-    GDALDataset * dataset;
-    dataset = (GDALDataset *) GDALOpen(sat_filepath.c_str(), GA_ReadOnly);
-    int cols = dataset->GetRasterXSize();
-    int rows = dataset->GetRasterYSize();
-    int channels = dataset->GetRasterCount();
+    GDALDataset * sat_dataset;
+    sat_dataset = (GDALDataset *) GDALOpen(sat_filepath.c_str(), GA_ReadOnly);
+    int sat_cols = sat_dataset->GetRasterXSize();
+    int sat_rows = sat_dataset->GetRasterYSize();
+    int channels = sat_dataset->GetRasterCount();
 
     GDALRasterBand * pBand;
-    pBand = dataset->GetRasterBand(1);
+    pBand = sat_dataset->GetRasterBand(1);
     int bGotMin, bGotMax;
     double adfMinMax[2];
     adfMinMax[0] = GDALGetRasterMinimum(pBand, &bGotMin);
@@ -39,23 +39,23 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     printf("Min=%.3f, Max=%.3f\n", adfMinMax[0], adfMinMax[1]);
 
     float *pBuffer;
-    pBuffer = (float *) CPLMalloc(sizeof(float) * cols * rows);
+    pBuffer = (float *) CPLMalloc(sizeof(float) * sat_cols * sat_rows);
     pBand->RasterIO(GF_Read,           // GDALRWFlag eRWFlag
                     0, 0,              // (xOff, yOff)
-                    cols, rows,        // (xSize, ySize)
+                    sat_cols, sat_rows,        // (xSize, ySize)
                     pBuffer,           // buffer
-                    cols, rows,        // buffer (xSize, ySize)
+                    sat_cols, sat_rows,        // buffer (xSize, ySize)
                     GDT_Float32,       // GDALDataType eBufType
                     0, 0);             // nPixelSpace, nLineSpace
 
     // Transform to OpenCV matrix
-    cv::Mat image(rows, cols, CV_8UC1);
-    for (int i = 0; i < rows * cols; ++i) {
-        image.data[i] = static_cast<uchar>(std::round(
+    cv::Mat img(sat_rows, sat_cols, CV_8UC1);
+    for (int i = 0; i < sat_rows * sat_cols; ++i) {
+        img.data[i] = static_cast<uchar>(std::round(
             (pBuffer[i] - adfMinMax[0]) / (adfMinMax[1] - adfMinMax[0]) * 255.
         ));
     }
-    cv::imwrite("tmp.png", image);
+    cv::imwrite("tmp.png", img);
 
     // Read DSM image
     GDALDataset * dsm_dataset;
@@ -83,42 +83,61 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     // RPC based transformer ... src is pixel/line/elev, dst is long/lat/elev
     GDALRPCInfo rpc;
     char ** rpc_meta;
-    rpc_meta = dataset->GetMetadata("RPC");
+    rpc_meta = sat_dataset->GetMetadata("RPC");
     GDALExtractRPCInfo(rpc_meta, &rpc);
 
     void * pTransform;
     pTransform = GDALCreateRPCTransformer(&rpc, false, 0.1, nullptr);
 
-    // dsm pixel + elevation
-    int col_d = 100;
-    int row_d = 200;
-    double elev = static_cast<double>(pDSMBuffer[row_d * dsm_cols + col_d]);
-    printf("col_d=%.3f, row_d=%.3f, elev=%.3f\n", float(col_d), float(row_d), float(elev));
-    // dsm geo + elevation
-    double geoX_d, geoY_d;
-    pixel2latlon(static_cast<double>(col_d),
-                 static_cast<double>(row_d),
-                 geoX_d, geoY_d, dsmGeoTransform);
-    printf("geoX_d=%.3f, geoY_d=%.3f, elev=%.3f\n", float(geoX_d), float(geoY_d), float(elev));
-    // dsm latlon
     const char * projection = dsm_dataset->GetProjectionRef();
     OGRSpatialReference * src = new OGRSpatialReference(projection);
     OGRSpatialReference * dst = new OGRSpatialReference();
     dst->SetWellKnownGeogCS("WGS84");
     OGRCoordinateTransformation * ct = OGRCreateCoordinateTransformation(src, dst);
-    double lon_d, lat_d;
-    lon_d = geoX_d;
-    lat_d = geoY_d;
-    double elev_d = elev;
-    ct->Transform(1, &lon_d, &lat_d, &elev_d);
-    printf("lon_d=%.3f, lat_d=%.3f, elev=%.3f\n", float(lon_d), float(lat_d), float(elev));
-    // sat pixels
-    double lng_to_pixel = lon_d;
-    double lat_to_line = lat_d;
-    double z = elev;
-    int success = 0;
-    GDALRPCTransform(pTransform, true, 1, &lng_to_pixel, &lat_to_line, &z, &success);
-    printf("col_s=%.3f, row_s=%.3f, elev=%.3f\n", float(lng_to_pixel), float(lat_to_line), float(z));
+
+    // dsm pixel + elevation
+    cv::Mat ortho_img(dsm_rows, dsm_cols, CV_8UC1);
+
+    // int col_d = 100;
+    // int row_d = 200;
+    for (int row_d = 0; row_d < dsm_rows; ++row_d) {
+        for (int col_d = 0; col_d < dsm_cols; ++col_d) {
+
+            double elev = static_cast<double>(pDSMBuffer[row_d * dsm_cols + col_d]);
+            // printf("col_d=%.3f, row_d=%.3f, elev=%.3f\n", float(col_d), float(row_d), float(elev));
+            // dsm geo + elevation
+            double geoX_d, geoY_d;
+            pixel2latlon(static_cast<double>(col_d),
+                         static_cast<double>(row_d),
+                         geoX_d, geoY_d, dsmGeoTransform);
+            // printf("geoX_d=%.3f, geoY_d=%.3f, elev=%.3f\n", float(geoX_d), float(geoY_d), float(elev));
+            // dsm latlon
+            double lon_d, lat_d;
+            lon_d = geoX_d;
+            lat_d = geoY_d;
+            double elev_d = elev;
+            ct->Transform(1, &lon_d, &lat_d, &elev_d);
+            // printf("lon_d=%.3f, lat_d=%.3f, elev=%.3f\n", float(lon_d), float(lat_d), float(elev));
+            // sat pixels
+            double lng_to_pixel = lon_d;
+            double lat_to_line = lat_d;
+            double z = elev;
+            int success = 0;
+            GDALRPCTransform(pTransform, true, 1, &lng_to_pixel, &lat_to_line, &z, &success);
+            // printf("col_s=%.3f, row_s=%.3f, elev=%.3f\n", float(lng_to_pixel), float(lat_to_line), float(z));
+
+            int col_s = static_cast<int>(lng_to_pixel);
+            int row_s = static_cast<int>(lat_to_line);
+            if ((col_s >= 0) && (col_s < sat_cols) &&
+                    (row_s >= 0) && (row_s < sat_cols)) {
+                ortho_img.data[row_d * dsm_cols + col_d] = img.data[row_s * sat_cols + col_s];
+            } else {
+                ortho_img.data[row_d * dsm_cols + col_d] = 0;
+            }
+        }  // col_d
+    }  // row_d
+
+    cv::imwrite("ortho.png", ortho_img);
 
     GDALDestroyRPCTransformer(pTransform);
 
