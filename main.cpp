@@ -23,7 +23,6 @@ void pixel2geo(int n, double * X, double * Y, double * transform) {
     }
 }
 
-
 template <typename T>
 T minthree(T a1, T a2, T a3) {
     return (a1 < a2) ? ((a1 < a3) ? a1 : a3) \
@@ -53,10 +52,16 @@ double interpolate_thee(double x, double y,
                         double x1, double y1, double v1,
                         double x2, double y2, double v2,
                         double x3, double y3, double v3) {
-   double w1 = 1.0 / dist(x, y, x1, y1);
-   double w2 = 1.0 / dist(x, y, x2, y2);
-   double w3 = 1.0 / dist(x, y, x3, y3);
-   return (w1 * v1 + w2 * v2 + w3 * v3) / (w1 + w2 + w3);
+   // double w1 = 1.0 / dist(x, y, x1, y1);
+   // double w2 = 1.0 / dist(x, y, x2, y2);
+   // double w3 = 1.0 / dist(x, y, x3, y3);
+   // return (w1 * v1 + w2 * v2 + w3 * v3) / (w1 + w2 + w3);
+   double denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+   double w1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denom;
+   double w2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denom;
+   double w3 = 1. - w1 - w2;
+
+   return (w1 * v1 + w2 * v2 + w3 * v3);
 }
 
 bool inside_triangle(double x, double y,
@@ -110,7 +115,6 @@ void draw_triangle(double x1, double y1, double elev1,
         }
     }
 }
-
 
 void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     double dsmIgnoreValue = 0.;
@@ -168,6 +172,14 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
 
     GDALRasterBand * pDSMBand;
     pDSMBand = dsm_dataset->GetRasterBand(1);
+
+    adfMinMax[0] = GDALGetRasterMinimum(pDSMBand, &bGotMin);
+    adfMinMax[1] = GDALGetRasterMaximum(pDSMBand, &bGotMax);
+    if( ! (bGotMin && bGotMax) )
+        GDALComputeRasterMinMax( pDSMBand, TRUE, adfMinMax );
+    printf("DSM: Min=%.3f, Max=%.3f\n", adfMinMax[0], adfMinMax[1]);
+    double dsmMinVal = adfMinMax[0];
+
     double *pDSMBuffer;
     pDSMBuffer = (double *) CPLMalloc(sizeof(double) * dsm_cols * dsm_rows);
     pDSMBand->RasterIO(GF_Read,             // GDALRWFlag eRWFlag
@@ -229,10 +241,12 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     // cv::Mat satElevImg(sat_rows, sat_cols, CV_32FC1, cv::Scalar(0));
     float * pSatElevImg;
     pSatElevImg = (float *) CPLMalloc(sizeof(float) * sat_cols * sat_rows);
-    std::fill(pSatElevImg, pSatElevImg + sat_cols * sat_rows, 0.);
+    std::fill(pSatElevImg, pSatElevImg + sat_cols * sat_rows, dsmMinVal);
     for (int row_d = 0; row_d < dsm_rows - 1; ++row_d) {
         for (int col_d = 0; col_d < dsm_cols - 1; ++col_d) {
             int idx = row_d * dsm_cols + col_d;
+            // triangular face **
+            //                 *
             // if ((pDSMBuffer[idx] != dsmIgnoreValue) and
             //         (pDSMBuffer[idx + 1] != dsmIgnoreValue) and
             //         (pDSMBuffer[idx + dsm_cols] != dsmIgnoreValue)) {
@@ -249,6 +263,8 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
                               pSatElevImg);
             }
 
+            // triangular face  *
+            //                 **
             // if ((pDSMBuffer[idx + dsm_cols + 1] != dsmIgnoreValue) and
             //         (pDSMBuffer[idx + 1] != dsmIgnoreValue) and
             //         (pDSMBuffer[idx + dsm_cols] != dsmIgnoreValue)) {
@@ -296,9 +312,13 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
             int idx = row_d * dsm_cols + col_d;
             int col_s = static_cast<int>(pXCoord[idx]);
             int row_s = static_cast<int>(pYCoord[idx]);
+            int idx_s = row_s * sat_cols + col_s;
+            if (std::abs(pSatElevImg[idx_s] - pDSMBuffer[idx]) > 1.) {
+                continue;
+            }
             if ((col_s >= 0) && (col_s < sat_cols) &&
                     (row_s >= 0) && (row_s < sat_cols)) {
-                ortho_img.data[idx] = img.data[row_s * sat_cols + col_s];
+                ortho_img.data[idx] = img.data[idx_s];
             } else {
                 ortho_img.data[idx] = 0;
             }
@@ -312,11 +332,14 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
 }
 
 int main() {
+    double time_total = omp_get_wtime();
     // std::string sat_filepath = "data/15APR10184641-P1BS-500647760060_01_P001.tif";
     // std::string dsm_filepath = "data/D3_AOI_DSM.tif";
     std::string sat_filepath = "data/15JAN21161243-P1BS-500648061050_01_P001.tif";
     std::string dsm_filepath = "data/D4_AOI_DSM.tif";
     readImage(sat_filepath, dsm_filepath);
+
+    printf("Total execution time: %.3fs\n", omp_get_wtime() - time_total);
     return 0;
 }
 
