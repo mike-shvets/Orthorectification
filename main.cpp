@@ -7,12 +7,11 @@ Misha Shvets <mshvets@cs.unc.edu>
 
 #include <omp.h>
 #include <math.h>
+#include <type_traits>
 #include "gdal_alg.h"
 #include "gdal_priv.h"
 #include "cpl_conv.h"
 #include "ogr_spatialref.h"
-
-#include "opencv2/opencv.hpp"
 
 void pixel2geo(int n, double * X, double * Y, double * transform) {
     for (int i = 0; i < n; ++i) {
@@ -81,10 +80,6 @@ void draw_triangle(double x1, double y1, double elev1,
                    double x3, double y3, double elev3,
                    int cols, int rows,
                    float * pImg) {
-    //               cv::Mat * pImg) {
-    // int cols = pImg->cols;
-    // int rows = pImg->rows;
-
     int imin = (int) round(minthree<double>(y1, y2, y3));
     int imax = (int) round(maxthree<double>(y1, y2, y3));
     int jmin = (int) round(minthree<double>(x1, x2, x3));
@@ -116,6 +111,35 @@ void draw_triangle(double x1, double y1, double elev1,
     }
 }
 
+template <typename T>
+void writeGTiff(const char* outFilename, T* pImg, int cols, int rows) {
+    GDALDataType gdal_type;
+    if (std::is_same<T, float>::value) {
+        gdal_type = GDT_Float32;
+    } else
+    if (std::is_same<T, uint8_t>::value) {
+        gdal_type = GDT_Byte;
+    }
+
+    const char *pszFormat = "GTiff";
+    GDALDriver *pDriver;
+    char **papszMetadata;
+    pDriver = GetGDALDriverManager()->GetDriverByName(pszFormat);
+    papszMetadata = pDriver->GetMetadata();
+
+    GDALDataset *pDstDS;
+    char **papszOptions = NULL;
+    pDstDS = pDriver->Create(outFilename, cols, rows,
+                             1, gdal_type, papszOptions);
+
+    GDALRasterBand *poBand;
+    poBand = pDstDS->GetRasterBand(1);
+    CPLErr e = poBand->RasterIO(GF_Write, 0, 0, cols, rows,
+                                pImg, cols, rows, gdal_type, 0, 0);
+
+    GDALClose((GDALDatasetH) pDstDS);
+}
+
 void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     double dsmIgnoreValue = 0.;
     double time_start;
@@ -142,22 +166,24 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
     time_start = omp_get_wtime();
     double *pBuffer;
     pBuffer = (double *) CPLMalloc(sizeof(double) * sat_cols * sat_rows);
-    pBand->RasterIO(GF_Read,           // GDALRWFlag eRWFlag
-                    0, 0,              // (xOff, yOff)
-                    sat_cols, sat_rows,        // (xSize, ySize)
-                    pBuffer,           // buffer
-                    sat_cols, sat_rows,        // buffer (xSize, ySize)
-                    GDT_Float64,       // GDALDataType eBufType
-                    0, 0);             // nPixelSpace, nLineSpace
+    CPLErr e = pBand->RasterIO(GF_Read,           // GDALRWFlag eRWFlag
+                               0, 0,              // (xOff, yOff)
+                               sat_cols, sat_rows,        // (xSize, ySize)
+                               pBuffer,           // buffer
+                               sat_cols, sat_rows,        // buffer (xSize, ySize)
+                               GDT_Float64,       // GDALDataType eBufType
+                               0, 0);             // nPixelSpace, nLineSpace
 
     // Transform to OpenCV matrix
-    cv::Mat img(sat_rows, sat_cols, CV_8UC1);
+    uint8_t* pSatImshow;
+    pSatImshow = (uint8_t *) CPLMalloc(sizeof(uint8_t) * sat_cols * sat_rows);
     for (int i = 0; i < sat_rows * sat_cols; ++i) {
-        img.data[i] = static_cast<uchar>(std::round(
+        pSatImshow[i] = static_cast<uint8_t>(std::round(
             (pBuffer[i] - adfMinMax[0]) / (adfMinMax[1] - adfMinMax[0]) * 255.
         ));
     }
-    cv::imwrite("tmp.png", img);
+    const char *satOutFilename = "output/tmp.tif";
+    writeGTiff<uint8_t>(satOutFilename, pSatImshow, sat_cols, sat_rows);
     printf("Finish reading the satellite image in %.3fs\n", omp_get_wtime() - time_start);
 
     // Read DSM image
@@ -182,13 +208,13 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
 
     double *pDSMBuffer;
     pDSMBuffer = (double *) CPLMalloc(sizeof(double) * dsm_cols * dsm_rows);
-    pDSMBand->RasterIO(GF_Read,             // GDALRWFlag eRWFlag
-                       0, 0,                // (xOff, yOff)
-                       dsm_cols, dsm_rows,  // (xSize, ySize)
-                       pDSMBuffer,          // buffer
-                       dsm_cols, dsm_rows,  // buffer (xSize, ySize)
-                       GDT_Float64,         // GDALDataType eBufType
-                       0, 0);               // nPixelSpace, nLineSpace
+    e = pDSMBand->RasterIO(GF_Read,             // GDALRWFlag eRWFlag
+                           0, 0,                // (xOff, yOff)
+                           dsm_cols, dsm_rows,  // (xSize, ySize)
+                           pDSMBuffer,          // buffer
+                           dsm_cols, dsm_rows,  // buffer (xSize, ySize)
+                           GDT_Float64,         // GDALDataType eBufType
+                           0, 0);               // nPixelSpace, nLineSpace
     printf("Finish reading the DSM image in %.3fs\n", omp_get_wtime() - time_start);
 
 
@@ -238,7 +264,6 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
 
     // Occlussion handling
     time_start = omp_get_wtime();
-    // cv::Mat satElevImg(sat_rows, sat_cols, CV_32FC1, cv::Scalar(0));
     float * pSatElevImg;
     pSatElevImg = (float *) CPLMalloc(sizeof(float) * sat_cols * sat_rows);
     std::fill(pSatElevImg, pSatElevImg + sat_cols * sat_rows, dsmMinVal);
@@ -283,6 +308,9 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
         }
     }
 
+    const char *pszDstFilename = "output/sat_elevation.tif";
+    writeGTiff<float>(pszDstFilename, pSatElevImg, sat_cols, sat_rows);
+    /*
     const char *pszFormat = "GTiff";
     GDALDriver *pDriver;
     char **papszMetadata;
@@ -291,7 +319,7 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
 
     GDALDataset *pSatElevationDS;
     char **papszOptions = NULL;
-    const char *pszDstFilename = "sat_elevation.tif";
+    const char *pszDstFilename = "output/sat_elevation.tif";
     pSatElevationDS = pDriver->Create(pszDstFilename, sat_cols, sat_rows,
                                       1, GDT_Float32, papszOptions);
 
@@ -301,12 +329,13 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
                      pSatElevImg, sat_cols, sat_rows, GDT_Float32, 0, 0);
 
     GDALClose((GDALDatasetH) pSatElevationDS);
-
+    */
     printf("Finish sattelite elevation rendering in %.3fs\n", omp_get_wtime() - time_start);
 
     // Image re-collection
     time_start = omp_get_wtime();
-    cv::Mat ortho_img(dsm_rows, dsm_cols, CV_8UC1);
+    uint8_t* pOrthoImshow;
+    pOrthoImshow = (uint8_t *) CPLMalloc(sizeof(uint8_t) * dsm_cols * dsm_rows);
     for (int row_d = 0; row_d < dsm_rows; ++row_d) {
         for (int col_d = 0; col_d < dsm_cols; ++col_d) {
             int idx = row_d * dsm_cols + col_d;
@@ -318,13 +347,14 @@ void readImage(const std::string sat_filepath, std::string dsm_filepath) {
             }
             if ((col_s >= 0) && (col_s < sat_cols) &&
                     (row_s >= 0) && (row_s < sat_cols)) {
-                ortho_img.data[idx] = img.data[idx_s];
+                pOrthoImshow[idx] = pSatImshow[idx_s];
             } else {
-                ortho_img.data[idx] = 0;
+                pOrthoImshow[idx] = 0;
             }
         }
     }
-    cv::imwrite("ortho2.png", ortho_img);
+    const char* orthoOutFilename = "output/ortho2.tif";
+    writeGTiff<uint8_t>(orthoOutFilename, pOrthoImshow, dsm_cols, dsm_rows);
     printf("Finish image re-collection in %.3fs\n", omp_get_wtime() - time_start);
 
     GDALDestroyRPCTransformer(pRPCTransform);
