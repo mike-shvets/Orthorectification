@@ -8,6 +8,10 @@ Not to be confused with the blocks of threads.
 #include <cuda_runtime.h>
 #include <stdio.h>
 
+#include <thrust/scan.h>
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
+
 #define DSM_MAX_TILES_PER_BLOCK 500
 #define DSM_MAX_TILES_PER_THREAD 500
 
@@ -31,9 +35,6 @@ Not to be confused with the blocks of threads.
 #define DSM_IGNORE_VALUE -1E5
 // extern const float DSM_IGNORE_VALUE;
 #define EPS 1E-3
-
-#define SCAN_BLOCK_DIM TPB
-#include "exclusiveScan.cu_inl"
 
 #define DTYPE float
 
@@ -74,240 +75,203 @@ __device__ bool d_inside_triangle(DTYPE x, DTYPE y,
     return (abs(A1 + A2 + A3 - A) < EPS);
 }
 
-__global__ void kernelRenderSatElevation(
-        DTYPE* pX, DTYPE* pY, DTYPE* pZ,
-        DTYPE* pOut,
-        DTYPE* pTilesBboxes,
-        int numDSMTiles, int numDSMTiles_X,
-        int dsm_width, int dsm_height,
-        int sat_width, int sat_height) {
-    // One thread block processes one sattelite tile
+__global__ void kernelComputePointsNum(DTYPE* pX, DTYPE* pY, DTYPE* pZ,
+                                       int* dsmPixelCounts,
+                                       int nfaces, int dsm_width,
+                                       int sat_width, int sat_height) {
+    int iface = blockIdx.x * blockDim.x + threadIdx.x;
+    if (iface < nfaces) {
+        int faces_per_row = 2 * (dsm_width - 1);
+        int irow = iface / faces_per_row;
+        int icol = (iface % faces_per_row) / 2;
+        int idx = irow * dsm_width + icol;
 
-    // linear thread index that is sorted into thread warps
-    int linearThreadIdx = threadIdx.y * blockDim.x + threadIdx.x;
-
-    // pixels being processed
-    int satTileX0 = blockIdx.x * SAT_PPB_1D;
-    int satTileY0 = blockIdx.y * SAT_PPB_1D;
-    int satTileX1 = satTileX0 + SAT_PPB_1D - 1;
-    int satTileY1 = satTileY0 + SAT_PPB_1D - 1;
-    if (blockIdx.x == gridDim.x - 1) {
-        satTileX1 = sat_width - 1;
-    }
-    if (blockIdx.y == gridDim.y - 1) {
-        satTileY1 = sat_height - 1;
-    }
-    DTYPE satTileBbox[] = {
-        static_cast<DTYPE>(satTileX0),
-        static_cast<DTYPE>(satTileY0),
-        static_cast<DTYPE>(satTileX1),
-        static_cast<DTYPE>(satTileY1),
-    };
-
-    __shared__ uint privateTileCount[TPB];
-    __shared__ uint accumPrivateTileCount[TPB];
-    // TODO: use tileIndex as scratch to save some memory
-    __shared__ uint privateTileCountScratch[2 * TPB];
-    __shared__ uint tileIndex [DSM_MAX_TILES_PER_BLOCK];
-
-    int dsmTilesPerThread = (numDSMTiles + TPB - 1) / TPB;
-    int dsmTilesStart = dsmTilesPerThread * linearThreadIdx;
-    int dsmTilesEnd = dsmTilesStart + dsmTilesPerThread;
-    // (linearThreadIdx == TPB - 1) condition is wrong, because here
-    // we divide the array into TPB parts, as opposed to dividing
-    // into parts of fixed size
-    dsmTilesEnd = fminf(dsmTilesEnd, numDSMTiles);
-
-    int numPrivateTiles = 0;
-    uint privateTileList[DSM_MAX_TILES_PER_THREAD];
-    for (int i = dsmTilesStart; i < dsmTilesEnd; ++i) {
-        if (d_rectanglesIntersect(pTilesBboxes + i * 4, satTileBbox))
-            privateTileList[numPrivateTiles++] = i;
-    }
-    privateTileCount[linearThreadIdx] = numPrivateTiles;
-    __syncthreads();
-    sharedMemExclusiveScan(linearThreadIdx, privateTileCount,
-                           accumPrivateTileCount, privateTileCountScratch, TPB);
-    __syncthreads();
-
-    // total number of DSM tiles that intersect with the current sat tile
-    int numTiles = privateTileCount[TPB - 1] + accumPrivateTileCount[TPB - 1];
-
-/*
-    // TODO: debug
-    for (int dx = 0; dx < SAT_PPT_1D; ++dx) {
-        for (int dy = 0; dy < SAT_PPT_1D; ++dy) {
-            int x = satTileX0 + SAT_PPT_1D * threadIdx.x + dx;
-            int y = satTileY0 + SAT_PPT_1D * threadIdx.y + dy;
-            if (x > sat_width - 1 || y > sat_height - 1) {
-                continue;
-            }
-            int pixelIndex = y * sat_width + x;
-            pOut[pixelIndex] = static_cast<DTYPE>(numTiles);
+        int idx1, idx2, idx3;
+        if (iface % 2 == 0) {
+            // **
+            // *
+            idx1 = idx;
+            idx2 = idx + 1;
+            idx3 = idx + dsm_width;
+        } else {
+            //  *
+            // **
+            idx1 = idx + 1;
+            idx2 = idx + dsm_width;
+            idx3 = idx + dsm_width + 1;
         }
-    }
-    int tmpIdx = (blockIdx.y * TPB_1D + threadIdx.y) * sat_width + blockIdx.x * TPB_1D + threadIdx.x;
-    if (tmpIdx < sat_height * sat_width) {
-        // pOut[tmpIdx] = static_cast<int>(accumPrivateTileCount[linearThreadIdx]);
-        pOut[tmpIdx] = static_cast<DTYPE>(numTiles);
-        // pOut[tmpIdx] = static_cast<DTYPE>(numPrivateTiles);
-    }
 
-    // end
-*/
+        if (pZ[idx1] < DSM_IGNORE_VALUE + 1 ||
+            pZ[idx2] < DSM_IGNORE_VALUE + 1 ||
+            pZ[idx3] < DSM_IGNORE_VALUE + 1) { return; }
+        
+        float x1, y1, x2, y2, x3, y3;
+        x1 = pX[idx1];
+        y1 = pY[idx1];
+        x2 = pX[idx2];
+        y2 = pY[idx2];
+        x3 = pX[idx3];
+        y3 = pY[idx3];
+        int ymin = static_cast<int>( ceilf(fminf(fminf(y1, y2), y3)) );
+        int xmin = static_cast<int>( ceilf(fminf(fminf(x1, x2), x3)) );
+        int ymax = static_cast<int>( floorf(fmaxf(fmaxf(y1, y2), y3)) );
+        int xmax = static_cast<int>( floorf(fmaxf(fmaxf(x1, x2), x3)) );
 
-    int curIndex = accumPrivateTileCount[linearThreadIdx];
-    for (int i = 0; i < numPrivateTiles; ++i) {
-        tileIndex[curIndex++] = privateTileList[i];
-    }
-    __syncthreads();
+        ymin = fmaxf(0, ymin);
+        xmin = fmaxf(0, xmin);
+        ymax = fminf(sat_height - 1, ymax);
+        xmax = fminf(sat_width - 1, xmax);
 
-    for (int iTile = 0; iTile < numTiles; ++iTile) {
-        int dsmTileIndex = tileIndex[iTile];
-
-        int dsmTileX0 = (dsmTileIndex % numDSMTiles_X) * (DSM_PPB_1D - 1);
-        int dsmTileY0 = (dsmTileIndex / numDSMTiles_X) * (DSM_PPB_1D - 1);
-        int dsmTileX1 = dsmTileX0 + DSM_PPB_1D - 1;
-        int dsmTileY1 = dsmTileY0 + DSM_PPB_1D - 1;
-        if (dsmTileX1 > dsm_width - 2) { dsmTileX1 = dsm_width - 2; }
-        if (dsmTileY1 > dsm_height - 2) { dsmTileY1 = dsm_height - 2; }
-
-        for (int row_d = dsmTileY0; row_d <= dsmTileY1; ++row_d) {
-            for (int col_d = dsmTileX0; col_d <= dsmTileX1; ++col_d) {
-                int idx = row_d * dsm_width + col_d;
-
-                for (int j = 0; j < 2; ++j) {
-                    DTYPE x1, y1, elev1, x2, y2, elev2, x3, y3, elev3;
-                    if (j == 0) {
-                        x1 = pX[idx] - satTileX0;
-                        y1 = pY[idx] - satTileY0;
-                        elev1 = pZ[idx];
-                        x2 = pX[idx + 1] - satTileX0;
-                        y2 = pY[idx + 1] - satTileY0;
-                        elev2 = pZ[idx + 1];
-                        x3 = pX[idx + dsm_width] - satTileX0;
-                        y3 = pY[idx + dsm_width] - satTileY0;
-                        elev3 = pZ[idx + dsm_width];
-                    }
-                    else {  // j == 1
-                        x1 = pX[idx + 1] - satTileX0;
-                        y1 = pY[idx + 1] - satTileY0;
-                        elev1 = pZ[idx + 1];
-                        x2 = pX[idx + dsm_width] - satTileX0;
-                        y2 = pY[idx + dsm_width] - satTileY0;
-                        elev2 = pZ[idx + dsm_width];
-                        x3 = pX[idx + dsm_width + 1] - satTileX0;
-                        y3 = pY[idx + dsm_width + 1] - satTileY0;
-                        elev3 = pZ[idx + dsm_width + 1];
-                    }
-
-                    // skip invalid faces
-                    if ((elev1 < DSM_IGNORE_VALUE + 1) ||
-                        (elev2 < DSM_IGNORE_VALUE + 1) ||
-                        (elev3 < DSM_IGNORE_VALUE + 1)) { continue; }
-
-                    for (int dx = 0; dx < SAT_PPT_1D; ++dx) {
-                        for (int dy = 0; dy < SAT_PPT_1D; ++dy) {
-                            int x = satTileX0 + SAT_PPT_1D * threadIdx.x + dx;
-                            int y = satTileY0 + SAT_PPT_1D * threadIdx.y + dy;
-                            if (x > sat_width - 1 || y > sat_height - 1) {
-                                continue;
-                            }
-                            int pixelIndex = y * sat_width + x;
-                            DTYPE fx = static_cast<DTYPE>(x) - satTileX0;
-                            DTYPE fy = static_cast<DTYPE>(y) - satTileY0;
-
-                            // if (d_inside_barycentric(
-                            if (d_inside_triangle(
-                                    fx, fy, x1, y1, x2, y2, x3, y3)) {
-                                DTYPE elev = d_interpolate_three(
-                                    fx, fy,
-                                    x1, y1, elev1,
-                                    x2, y2, elev2,
-                                    x3, y3, elev3);
-                                if (elev > pOut[pixelIndex]) {
-                                    pOut[pixelIndex] = elev;
-                                }
-                            }
-                        }
+        //if ((xmax - xmin) * (ymax - ymin) > 100) {
+        //    dsmPixelCounts[iface] = -1;
+        //} else {
+        {
+            for (int x = xmin; x <= xmax; ++x) {
+                for (int y = ymin; y <= ymax; ++y) {
+                    if (d_inside_triangle((float) x - x1, (float) y - y1,
+                                          0, 0, x2-x1, y2-y1, x3-x1, y3-y1)) {
+                        dsmPixelCounts[iface] += 1;
                     }
                 }
             }
         }
     }
-/*
-*/
 }
 
-__global__ void kernelFindDSMBlocksBbox(DTYPE* pX, DTYPE* pY, DTYPE* pZ,
-                                        DTYPE* pBbox,
-                                        int width, int height) {
-    // Each block processes a DSM tile that is referenced by blockIdx
+__global__ void kernelGetPoints(DTYPE* pX, DTYPE* pY, DTYPE* pZ,
+                                int* dsmPixelCounts,
+                                int* faceIDs, int* pixelIDs,
+                                int nfaces, int dsm_width,
+                                int sat_width, int sat_height) {
+    int iface = blockIdx.x * blockDim.x + threadIdx.x;
+    if (iface < nfaces) {
+        int curIdx = dsmPixelCounts[iface];
 
-    int dsmStep = DSM_PPB_1D - 1;
-    int rowTileOffset = blockIdx.y * dsmStep;
-    int colTileOffset = blockIdx.x * dsmStep;
-    // thread linear index within a block
-    int linearThreadIdx = threadIdx.y * blockDim.x + threadIdx.x;
+        int faces_per_row = 2 * (dsm_width - 1);
+        int irow = iface / faces_per_row;
+        int icol = (iface % faces_per_row) / 2;
+        int idx = irow * dsm_width + icol;
 
-    __shared__ DTYPE cacheX0[TPB];
-    __shared__ DTYPE cacheX1[TPB];
-    __shared__ DTYPE cacheY0[TPB];
-    __shared__ DTYPE cacheY1[TPB];
-
-    // find thread-private local values
-    // each thread is allowed to process up to DSM_PPB_1D pixels
-    DTYPE localX0 = 1E10;
-    DTYPE localY0 = 1E10;
-    DTYPE localX1 = -1E10;
-    DTYPE localY1 = -1E10;
-    for (int i = 0; i < DSM_PPT_1D; ++i) {
-        for (int j = 0; j < DSM_PPT_1D; ++j) {
-            int y = rowTileOffset + threadIdx.y * DSM_PPT_1D + i;
-            int x = colTileOffset + threadIdx.x * DSM_PPT_1D + j;
-            if (y >= height || x >= width) { continue; }
-            // global pixel index
-            int pixelIdx = y * width + x;
-            if (pZ[pixelIdx] < DSM_IGNORE_VALUE + 1) { continue; }
-
-            localX0 = fminf(localX0, pX[pixelIdx]);
-            localX1 = fmaxf(localX1, pX[pixelIdx]);
-            localY0 = fminf(localY0, pY[pixelIdx]);
-            localY1 = fmaxf(localY1, pY[pixelIdx]);
-        }
-    }
-
-    cacheX0[linearThreadIdx] = localX0;
-    cacheY0[linearThreadIdx] = localY0;
-    cacheX1[linearThreadIdx] = localX1;
-    cacheY1[linearThreadIdx] = localY1;
-    __syncthreads();
-
-    // reduction op
-    int threadsPerBlock = blockDim.x * blockDim.y;
-    int i = threadsPerBlock / 2;
-    while (i != 0) {
-        if (linearThreadIdx < i) {
-            cacheX0[linearThreadIdx] = fmin(cacheX0[linearThreadIdx],
-                                            cacheX0[linearThreadIdx + i]);
-            cacheY0[linearThreadIdx] = fmin(cacheY0[linearThreadIdx],
-                                            cacheY0[linearThreadIdx + i]);
-            cacheX1[linearThreadIdx] = fmax(cacheX1[linearThreadIdx],
-                                            cacheX1[linearThreadIdx + i]);
-            cacheY1[linearThreadIdx] = fmax(cacheY1[linearThreadIdx],
-                                            cacheY1[linearThreadIdx + i]);
+        int idx1, idx2, idx3;
+        if (iface % 2 == 0) {
+            // **
+            // *
+            idx1 = idx;
+            idx2 = idx + 1;
+            idx3 = idx + dsm_width;
+        } else {
+            //  *
+            // **
+            idx1 = idx + 1;
+            idx2 = idx + dsm_width;
+            idx3 = idx + dsm_width + 1;
         }
 
-        __syncthreads();
-        i /= 2;
-    }
+        if (pZ[idx1] < DSM_IGNORE_VALUE + 1 ||
+            pZ[idx2] < DSM_IGNORE_VALUE + 1 ||
+            pZ[idx3] < DSM_IGNORE_VALUE + 1) { return; }
+        
+        float x1, y1, x2, y2, x3, y3;
+        x1 = pX[idx1];
+        y1 = pY[idx1];
+        x2 = pX[idx2];
+        y2 = pY[idx2];
+        x3 = pX[idx3];
+        y3 = pY[idx3];
+        int ymin = static_cast<int>( ceilf(fminf(fminf(y1, y2), y3)) );
+        int xmin = static_cast<int>( ceilf(fminf(fminf(x1, x2), x3)) );
+        int ymax = static_cast<int>( floorf(fmaxf(fmaxf(y1, y2), y3)) );
+        int xmax = static_cast<int>( floorf(fmaxf(fmaxf(x1, x2), x3)) );
 
-    if (linearThreadIdx == 0) {
-        int linearBlockIdx = blockIdx.y * gridDim.x + blockIdx.x;
-        pBbox[linearBlockIdx * 4 + 0] = cacheX0[0];
-        pBbox[linearBlockIdx * 4 + 1] = cacheY0[0];
-        pBbox[linearBlockIdx * 4 + 2] = cacheX1[0];
-        pBbox[linearBlockIdx * 4 + 3] = cacheY1[0];
+        ymin = fmaxf(0, ymin);
+        xmin = fmaxf(0, xmin);
+        ymax = fminf(sat_height - 1, ymax);
+        xmax = fminf(sat_width - 1, xmax);
+
+        //if ((xmax - xmin) * (ymax - ymin) > 100) {
+        //    dsmPixelCounts[iface] = -1;
+        //} else {
+        {
+            for (int x = xmin; x <= xmax; ++x) {
+                for (int y = ymin; y <= ymax; ++y) {
+                    if (d_inside_triangle((float) x - x1, (float) y - y1,
+                                          0, 0, x2-x1, y2-y1, x3-x1, y3-y1)) {
+                        faceIDs[curIdx] = iface;
+                        pixelIDs[curIdx] = y * sat_width + x;
+                        curIdx++;
+                    }
+                }
+            }
+        }
+    }
+}
+
+__global__ void kernelFindLimits(int* ids, int* limits, int num) {
+    int iel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (iel < num) {
+        int pixelID = ids[iel];
+        if (iel == 0 || ids[iel - 1] != pixelID) {
+            limits[pixelID * 2 + 0] = iel;
+        }
+        if (iel == num - 1 || ids[iel + 1] != pixelID) {
+            limits[pixelID * 2 + 1] = iel + 1;
+        }
+    }
+}
+
+__global__ void kernelDraw(int* faceIDs, int* pixelIDsLimits,
+                           float* pX, float* pY, float* pZ,
+                           float* pOut,
+                           int sat_npixels, int dsm_width, int sat_width) {
+    int ipixel = blockIdx.x * blockDim.x + threadIdx.x;
+    if (ipixel < sat_npixels) {
+        int faces_per_row = 2 * (dsm_width - 1);
+        for (int i = pixelIDsLimits[2 * ipixel + 0];
+                 i < pixelIDsLimits[2 * ipixel + 1]; ++i) {
+            int iface = faceIDs[i];
+
+            int irow = iface / faces_per_row;
+            int icol = (iface % faces_per_row) / 2;
+            int idx = irow * dsm_width + icol;
+
+            int idx1, idx2, idx3;
+            if (iface % 2 == 0) {
+                // **
+                // *
+                idx1 = idx;
+                idx2 = idx + 1;
+                idx3 = idx + dsm_width;
+            } else {
+                //  *
+                // **
+                idx1 = idx + 1;
+                idx2 = idx + dsm_width;
+                idx3 = idx + dsm_width + 1;
+            }
+
+            float x1, y1, elev1, x2, y2, elev2, x3, y3, elev3;
+            x1 = pX[idx1];
+            y1 = pY[idx1];
+            elev1 = pZ[idx1];
+            x2 = pX[idx2];
+            y2 = pY[idx2];
+            elev2 = pZ[idx2];
+            x3 = pX[idx3];
+            y3 = pY[idx3];
+            elev3 = pZ[idx3];
+
+            float x = static_cast<float>(ipixel % sat_width);
+            float y = static_cast<float>(ipixel / sat_width);
+            
+            float elev = d_interpolate_three(x, y,
+                                             x1, y1, elev1,
+                                             x2, y2, elev2,
+                                             x3, y3, elev3);
+
+            if (elev > pOut[ipixel]) {
+                pOut[ipixel] = elev;
+            }
+        }
     }
 }
 
@@ -330,123 +294,82 @@ void cudaRenderSatElevation(DTYPE * pX, DTYPE* pY, DTYPE* pZ, DTYPE* pOut,
     // output memory on host contains all min values
     cudaMemcpy(d_pOut, pOut, sizeof(DTYPE) * sat_npixels, cudaMemcpyHostToDevice);
 
-    // number of tiles:
-    // DSM tiles overlap by 1 pixel,
-    // because they are split into triangular faces
-    int dsmStep = DSM_PPB_1D - 1;
-    int dsmTiles_X = ((dsm_width - DSM_PPB_1D) + dsmStep - 1) / dsmStep + 1;
-    int dsmTiles_Y = ((dsm_height - DSM_PPB_1D) + dsmStep - 1) / dsmStep + 1;
-    int dsmTiles = dsmTiles_X * dsmTiles_Y;
-    // tile bounding boxes
-    DTYPE* d_pDSMBbox;
-    cudaMalloc((void **)&d_pDSMBbox, sizeof(DTYPE) * 4 * dsmTiles);
-    // cudaMemset(d_pDSMBbox, 0, sizeof(DTYPE) * 4 * dsmTiles);
-
-    // blocks are linked to tiles, threads are linked to pixels
-    dim3 dsmBlocks(dsmTiles_X, dsmTiles_Y);
-    dim3 dsmThreadsPerBlock(TPB_1D, TPB_1D);
-    kernelFindDSMBlocksBbox<<<dsmBlocks, dsmThreadsPerBlock>>>(
-        d_pX, d_pY, d_pZ,
-        d_pDSMBbox,
-        dsm_width, dsm_height
-    );
-    cudaThreadSynchronize();
-    // cudaDeviceSynchronize();
+    int nfaces = 2 * (dsm_height - 1) * (dsm_width - 1);
+    int nblocks = (nfaces + TPB - 1) / TPB;
+    // compute # of pixels that each face cover
+    // TODO: change to int
+    int* dsmPixelCounts;
+    cudaMalloc((void **)&dsmPixelCounts, sizeof(int) * nfaces);
+    cudaMemset(dsmPixelCounts, 0, sizeof(int) * nfaces);
+    kernelComputePointsNum<<<nblocks, TPB>>>(d_pX, d_pY, d_pZ,
+                                             dsmPixelCounts, nfaces,
+                                             dsm_width, sat_width, sat_height);
+    // cudaThreadSynchronize();
+    cudaDeviceSynchronize();
     if ( cudaSuccess != cudaGetLastError() )
-        printf( "Error in CUDA kernel attempting to find DSM blocks bounding boxes!\n" );
+        printf( "Error in CUDA kernel attempting to compute number of points "
+                "for each thread!\n" );
 
-    // // check output:
-    // DTYPE x0 = 1E10;
-    // DTYPE y0 = 1E10;
-    // DTYPE x1 = -1E10;
-    // DTYPE y1 = -1E10;
-    // int istart = 1600;
-    // int jstart = 800;
-    // for (int i = istart; i < istart+16; ++i) {
-    //     for (int j = jstart; j < jstart+16; ++j) {
-    //         int idx = i * width + j;
-    //         if (pX[idx] < x0)
-    //             x0 = pX[idx];
-    //         if (pX[idx] > x1)
-    //             x1 = pX[idx];
-    //         if (pY[idx] < y0)
-    //             y0 = pY[idx];
-    //         if (pY[idx] > y1)
-    //             y1 = pY[idx];
-    //     }
-    // }
-    // DTYPE tmp[4];
-    // cudaMemcpy(tmp, d_pDSMBbox + 4 * ((istart/16)*dsmTiles_X + (jstart/16)), sizeof(DTYPE) * 4, cudaMemcpyDeviceToHost);
-    // printf("%d %d\n", dsmTiles_X, dsmTiles_Y);
-    // printf("%.3f %.3f %.3f %.3f\n", tmp[0], tmp[1], tmp[2], tmp[3]);
-    // printf("%.3f %.3f %.3f %.3f\n", x0, y0, x1, y1);
-/*
-    int tmpStartTile = 0;
-    for (int i = tmpStartTile; i < tmpStartTile + dsmTiles; ++i) {
-        DTYPE tmp[4];
-        cudaMemcpy(tmp, d_pDSMBbox + 4 * i, sizeof(DTYPE) * 4, cudaMemcpyDeviceToHost);
-        // int x = 28;
-        bool flag = true;
-        for (int y = 0; y < 32; ++y) {
-        for (int x = 0; x < 32; ++x) {
-            if (flag && (tmp[0] <= x) && (tmp[1] <= y) && (tmp[2] >= x) && (tmp[3] >= y)) {
-                printf(">>>>>>>>>>>>>>> %d %d, %d\n", i, dsmTiles_X, dsmTiles_Y);
-                flag = false;
-            }
-        }}
-        // printf("%.1f %.1f %.1f %.1f\n", tmp[0], tmp[1], tmp[2], tmp[3]);
-    }
-*/
-/*
-*/
-    // cudaMemcpy(pOut, d_pDSMBbox, sizeof(DTYPE) * 4 * dsmTiles,
-    //            cudaMemcpyDeviceToHost);
-    // printf("=========================== %d %.3f, %.3f\n", dsmTiles, pOut[0], pOut[1]);
-    // return;
+    int numPixelsLast;
+    cudaMemcpy(&numPixelsLast, dsmPixelCounts + nfaces - 1, sizeof(int),
+               cudaMemcpyDeviceToHost);
 
-    // blocks per grid
-    const int BPG_X = (sat_width + SAT_PPB_1D - 1) / SAT_PPB_1D;
-    const int BPG_Y = (sat_height + SAT_PPB_1D - 1) / SAT_PPB_1D;
-    dim3 satBlocks(BPG_X, BPG_Y);
-    dim3 satThreadsPerBlock(TPB_1D, TPB_1D);
-    // printf("%d %d %d %d %d %d\n", TPB_1D, TPB, SAT_PPT_1D, SAT_PPT, SAT_PPB_1D, SAT_PPB);
-    // printf("============== %d %d\n", BPG_X, BPG_Y);
-    kernelRenderSatElevation<<<satBlocks, satThreadsPerBlock>>>(
-        d_pX, d_pY, d_pZ, d_pOut,
-        d_pDSMBbox,
-        dsmTiles, dsmTiles_X,
-        dsm_width, dsm_height,
-        sat_width, sat_height);
-    cudaThreadSynchronize();
-    // cudaDeviceSynchronize();
+    // exclusive scan to get start index for each face
+    thrust::exclusive_scan(thrust::device, dsmPixelCounts,
+                           dsmPixelCounts + nfaces, dsmPixelCounts);
+
+    //
+    int numPixelsTotal;
+    cudaMemcpy(&numPixelsTotal, dsmPixelCounts + nfaces - 1, sizeof(int),
+               cudaMemcpyDeviceToHost);
+    numPixelsTotal += numPixelsLast;
+    printf("================= %d\n", numPixelsTotal);
+    int* faceIDs;
+    int* pixelIDs;
+    cudaMalloc((void **)&faceIDs, sizeof(int) * numPixelsTotal);
+    cudaMalloc((void **)&pixelIDs, sizeof(int) * numPixelsTotal);
+    kernelGetPoints<<<nblocks, TPB>>>(d_pX, d_pY, d_pZ,
+                                      dsmPixelCounts,
+                                      faceIDs, pixelIDs,
+                                      nfaces,
+                                      dsm_width, sat_width, sat_height);
+    cudaDeviceSynchronize();
     if ( cudaSuccess != cudaGetLastError() )
-        printf( "Error in CUDA kernel attempting to render satellite elevation!\n" );
+        printf( "Error in CUDA kernel attempting to "
+                "get points ids for each face!\n" );
 
+    // sort by key
+    thrust::sort_by_key(thrust::device, pixelIDs, pixelIDs + numPixelsTotal,
+                        faceIDs);
+    cudaDeviceSynchronize();
+    if ( cudaSuccess != cudaGetLastError() )
+        printf( "Error in CUDA kernel attempting to "
+                "sort!\n" );
+   
+    // find start and end points for each pixel
+    int* pixelIDsLimits;
+    cudaMalloc((void **)&pixelIDsLimits, 2 * sizeof(int) * sat_npixels);
+    cudaMemset(pixelIDsLimits, 0, 2 * sizeof(int) * sat_npixels);
+    nblocks = (numPixelsTotal + TPB - 1) / TPB;
+    kernelFindLimits<<<nblocks, TPB>>>(pixelIDs, pixelIDsLimits, numPixelsTotal);
+    cudaDeviceSynchronize();
+    if ( cudaSuccess != cudaGetLastError() )
+        printf( "Error in CUDA kernel attempting to "
+                "find start and end positions for each pixel!\n" );
+
+    //
+    nblocks = (sat_npixels + TPB - 1) / TPB;
+    kernelDraw<<<nblocks, TPB>>>(faceIDs, pixelIDsLimits, d_pX, d_pY, d_pZ,
+                                d_pOut,
+                                sat_npixels, dsm_width, sat_width);
+    cudaDeviceSynchronize();
+    if ( cudaSuccess != cudaGetLastError() )
+        printf( "Error in CUDA kernel attempting to "
+                "draw satellite elevation!\n" );
+
+    
+    // cudaMemcpy(pOut, dsmPixelCounts, sizeof(float) * min(sat_npixels, nfaces), cudaMemcpyDeviceToHost);
     cudaMemcpy(pOut, d_pOut, sizeof(DTYPE) * sat_npixels,
                cudaMemcpyDeviceToHost);
-/*
-    int tmpStartI = 0;
-    int tmpStartJ = 0;
-    for (int i = tmpStartI; i < tmpStartI + TPB_1D; ++i) {
-        for (int j = tmpStartJ; j < tmpStartJ + TPB_1D; ++j) {
-            printf("%.3f ", pOut[i * out_width + j]);
-        }
-        printf("\n");
-    }
-    printf("\n");
-    DTYPE tmpMax = 0;
-    DTYPE tmpAvg = 0;
-    int tmpCount = 0;
-    for (int i = 0; i < out_height * out_width; ++i) {
-        tmpMax = fmaxf(tmpMax, pOut[i]);
-        tmpAvg += pOut[i];
-        if (pOut[i] > 20) {
-            tmpCount++;
-        }
-    }
-    printf("%.1f\n", tmpMax);
-    printf("%.1f\n", tmpAvg / (out_height * out_width));
-    printf("%d\n", tmpCount);
-*/
 }
 

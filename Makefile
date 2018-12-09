@@ -13,11 +13,11 @@ LOGS	   := logs
 ###########################################################
 
 OBJDIR=objs
-CXX=g++ -m64 -std=c++11
-CXXFLAGS=-O3 -Wall `gdal-config --cflags` -Ofast -fopenmp
+CXX=g++ -std=c++11
+CXXFLAGS=-Wall `gdal-config --cflags` -Ofast -fopenmp
 LDFLAGS=-L/usr/local/cuda/lib64/ -lcudart `gdal-config --libs` -lgdal
 NVCC=nvcc
-NVCCFLAGS=-O3 -m64 --gpu-architecture compute_35
+NVCCFLAGS=-O3 --gpu-architecture compute_35
 
 
 OBJS=$(OBJDIR)/main.o  $(OBJDIR)/cudaRenderer.o
